@@ -4,6 +4,7 @@ on:
   push:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
+  workflow_call:
 
 permissions:
   contents: read
@@ -19,7 +20,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version-file: .python-version
+          python-version: "3.13"
 
       - name: Setup uv
         uses: astral-sh/setup-uv@v3
@@ -47,7 +48,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version-file: .python-version
+          python-version: "3.13"
 
       - name: Setup uv
         uses: astral-sh/setup-uv@v3

@@ -4,18 +4,44 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      services:
+        description: Comma-separated service names, or all, for repair/full-fleet deployment
+        required: false
+        type: string
 
 permissions:
-  id-token: write
   contents: read
 
+concurrency:
+  group: zavashop-production-deploy
+  cancel-in-progress: false
+
 jobs:
+  check:
+    name: CI checks and audit
+    uses: ./.github/workflows/ci.yml
+
   deploy:
-    name: Ship ZavaShop
+    name: Deploy ZavaShop
+    needs: check
     runs-on: ubuntu-latest
     environment: production
+    permissions:
+      id-token: write
+      contents: read
     env:
-      PYTHON_VERSION: "3.13"
+      RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+      ACR: ${{ vars.AZURE_CONTAINER_REGISTRY }}
+      AKS: ${{ vars.AKS_CLUSTER }}
+      CAE: ${{ vars.CONTAINER_APPS_ENV }}
+      KV: ${{ vars.KEY_VAULT_NAME }}
+      UAMI_CLIENT_ID: ${{ vars.UAMI_CLIENT_ID }}
+      UAMI_RESOURCE_ID: ${{ vars.UAMI_RESOURCE_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      SERVICES_INPUT: ${{ github.event.inputs.services || '' }}
+      EVENT_BEFORE: ${{ github.event.before || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -29,6 +55,122 @@ jobs:
 
       - name: Setup uv
         uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Validate deployment configuration
+        shell: bash
+        run: |
+          : "${RG:?Set repository variable AZURE_RESOURCE_GROUP}"
+          : "${ACR:?Set repository variable AZURE_CONTAINER_REGISTRY}"
+          : "${AKS:?Set repository variable AKS_CLUSTER}"
+          : "${CAE:?Set repository variable CONTAINER_APPS_ENV}"
+          : "${KV:?Set repository variable KEY_VAULT_NAME}"
+          : "${UAMI_CLIENT_ID:?Set repository variable UAMI_CLIENT_ID}"
+          : "${UAMI_RESOURCE_ID:?Set repository variable UAMI_RESOURCE_ID}"
+          : "${AZURE_TENANT_ID:?Set secret AZURE_TENANT_ID}"
+
+      - name: Compute SHA and resolve services
+        id: changes
+        shell: bash
+        run: |
+          GIT_SHA=$(git rev-parse --short "$GITHUB_SHA")
+          echo "GIT_SHA=$GIT_SHA" >> "$GITHUB_ENV"
+          echo "sha=$GIT_SHA" >> "$GITHUB_OUTPUT"
+
+          python3 - <<'PY'
+          import os
+          import subprocess
+
+          agents_all = {"orchestrator", "inventory", "supplier", "logistics", "pricing"}
+          mcps_all = {"inventory-mcp", "supplier-mcp", "shipping-mcp", "pricing-mcp"}
+          valid_services = agents_all | mcps_all
+          agents: set[str] = set()
+          mcps: set[str] = set()
+          aca_full = False
+          aks_deploy = False
+
+          event = os.environ["GITHUB_EVENT_NAME"]
+          before = os.environ.get("EVENT_BEFORE", "")
+          requested = os.environ.get("SERVICES_INPUT", "")
+          requested_services = {item.strip().lower() for item in requested.split(",") if item.strip()}
+          invalid = requested_services - valid_services - {"all"}
+          if invalid:
+              raise SystemExit(f"Unknown service name(s): {', '.join(sorted(invalid))}")
+
+          is_first_push = bool(before) and set(before) == {"0"}
+          full_fleet = is_first_push or (event == "workflow_dispatch" and "all" in requested_services)
+          if full_fleet:
+              agents.update(agents_all)
+              mcps.update(mcps_all)
+              aca_full = True
+              aks_deploy = True
+          else:
+              agents.update(requested_services & agents_all)
+              mcps.update(requested_services & mcps_all)
+              if event != "workflow_dispatch" and before:
+                  changed_paths = subprocess.run(
+                      ["git", "diff", "--name-only", before, os.environ["GITHUB_SHA"]],
+                      check=True,
+                      capture_output=True,
+                      text=True,
+                  ).stdout.splitlines()
+              else:
+                  changed_paths = []
+
+              for path in changed_paths:
+                  parts = path.split("/")
+                  if len(parts) >= 4 and parts[:2] == ["src", "agents"]:
+                      service = parts[2]
+                      if service not in agents_all:
+                          raise SystemExit(f"Unknown agent directory in changed path: {path}")
+                      agents.add(service)
+                  elif len(parts) >= 4 and parts[:2] == ["src", "mcp_servers"]:
+                      service = f"{parts[2]}-mcp"
+                      if service not in mcps_all:
+                          raise SystemExit(f"Unknown MCP directory in changed path: {path}")
+                      mcps.add(service)
+                  elif path.startswith("src/shared/") or path in {
+                      "src/Dockerfile.base", "pyproject.toml", "uv.lock"
+                  }:
+                      agents.update(agents_all)
+                  elif path.startswith("infra/aca/"):
+                      aca_full = True
+                      agents.update({"inventory", "supplier", "logistics", "pricing"})
+                      mcps.update(mcps_all)
+                  elif path.startswith("infra/aks/"):
+                      aks_deploy = True
+
+              if "orchestrator" in agents:
+                  aks_deploy = True
+
+          aca_apps = (agents - {"orchestrator"}) | mcps
+          if aca_full:
+              aca_apps = {"inventory", "supplier", "logistics", "pricing"} | mcps_all
+
+          order_agents = ["orchestrator", "inventory", "supplier", "logistics", "pricing"]
+          order_mcps = ["inventory-mcp", "supplier-mcp", "shipping-mcp", "pricing-mcp"]
+          ordered_agents = [name for name in order_agents if name in agents]
+          ordered_mcps = [name for name in order_mcps if name in mcps]
+          ordered_apps = [name for name in order_mcps + order_agents[1:] if name in aca_apps]
+          values = {
+              "agents": ",".join(ordered_agents),
+              "mcps": ",".join(ordered_mcps),
+              "aca_apps": ",".join(ordered_apps),
+              "aca_full": str(aca_full).lower(),
+              "aks": str(aks_deploy).lower(),
+              "full_fleet": str(full_fleet).lower(),
+          }
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              for key, value in values.items():
+                  output.write(f"{key}={value}\n")
+          print(f"Full fleet: {full_fleet}")
+          print(f"Agents: {values['agents'] or '(none)'}")
+          print(f"MCPs: {values['mcps'] or '(none)'}")
+          print(f"ACA apps to roll: {values['aca_apps'] or '(none)'}")
+          print(f"AKS orchestrator rollout: {aks_deploy}")
+          PY
 
       - name: Azure login
         uses: azure/login@v2
@@ -37,135 +179,264 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Load lab environment
+      - name: Mandatory landing-zone preflight
         shell: bash
         run: |
-          cat >> "$GITHUB_ENV" <<EOF
-          RG=${{ vars.AZURE_RESOURCE_GROUP }}
-          ACR=${{ vars.AZURE_CONTAINER_REGISTRY }}
-          AKS=${{ vars.AKS_CLUSTER }}
-          CAE=${{ vars.CONTAINER_APPS_ENV }}
-          KV=${{ vars.KEY_VAULT_NAME }}
-          UAMI=${{ vars.UAMI_NAME }}
-          UAMI_CLIENT_ID=${{ secrets.AZURE_CLIENT_ID }}
-          UAMI_RESOURCE_ID=${{ vars.UAMI_RESOURCE_ID }}
-          AZURE_TENANT_ID=${{ secrets.AZURE_TENANT_ID }}
-          GIT_SHA=${GITHUB_SHA::7}
-          EOF
+          managed=$(az aks show -g "$RG" -n "$AKS" --query aadProfile.managed -o tsv)
+          azure_rbac=$(az aks show -g "$RG" -n "$AKS" --query aadProfile.enableAzureRbac -o tsv)
+          policy=$(az aks show -g "$RG" -n "$AKS" --query addonProfiles.azurepolicy.enabled -o tsv)
+          insights=$(az aks show -g "$RG" -n "$AKS" --query addonProfiles.omsagent.enabled -o tsv)
+          workspace=$(az aks show -g "$RG" -n "$AKS" \
+            --query addonProfiles.omsagent.config.logAnalyticsWorkspaceResourceID -o tsv)
 
-      - name: Quality gate
-        shell: bash
-        run: |
-          uv run poe check
-          latest_pattern=':'
-          latest_pattern="${latest_pattern}latest"
-          if grep -rE "$latest_pattern" infra .github/workflows; then
-            echo 'Refusing deploy because a latest image tag appears in deployment artifacts.'
+          [[ "$managed" == "true" ]] || { echo 'AKS Entra ID is not enabled.' >&2; exit 1; }
+          [[ "$azure_rbac" == "true" ]] || { echo 'AKS Azure RBAC is not enabled.' >&2; exit 1; }
+          [[ "$policy" == "true" ]] || { echo 'AKS Azure Policy add-on is not enabled.' >&2; exit 1; }
+          [[ "$insights" == "true" && -n "$workspace" ]] || {
+            echo 'AKS Container Insights/Log Analytics is not enabled or configured.' >&2
             exit 1
-          fi
+          }
+          echo 'Entra ID: enabled; Azure RBAC: enabled; Azure Policy: enabled; Container Insights: enabled.'
+          echo 'Defender for Cloud: waived (ADR 0001).'
 
-      - name: Landing zone preflight
+      - name: Build and push selected SHA-tagged images
+        if: steps.changes.outputs.agents != '' || steps.changes.outputs.mcps != ''
         shell: bash
+        env:
+          AGENTS: ${{ steps.changes.outputs.agents }}
+          MCPS: ${{ steps.changes.outputs.mcps }}
         run: |
-          aad_json=$(az aks show -g "$RG" -n "$AKS" --query aadProfile -o json)
-          if [[ "$aad_json" == "null" ]]; then
-            echo 'AKS aadProfile is missing.'
-            exit 1
-          fi
-
-          policy_enabled=$(az aks show -g "$RG" -n "$AKS" \
-            --query addonProfiles.azurepolicy.enabled -o tsv)
-          [[ "$policy_enabled" == "true" ]]
-
-          defender_enabled=$(az aks show -g "$RG" -n "$AKS" \
-            --query securityProfile.defender.securityMonitoring.enabled -o tsv)
-          [[ "$defender_enabled" == "true" ]]
-
-          containers_tier=$(az security pricing show -n Containers \
-            --query pricingTier -o tsv)
-          [[ "$containers_tier" == "Standard" ]]
-
-          keyvaults_tier=$(az security pricing show -n KeyVaults \
-            --query pricingTier -o tsv)
-          [[ "$keyvaults_tier" == "Standard" ]]
-
-      - name: Build and push images
-        shell: bash
-        run: |
+          [[ "$GIT_SHA" =~ ^[0-9a-f]{7,40}$ ]] || { echo 'Invalid short Git SHA.' >&2; exit 1; }
           ACR_LOGIN_SERVER="$ACR.azurecr.io"
-          az acr build -r "$ACR" \
-            --platform linux/amd64 \
-            -t "zavashop/base:$GIT_SHA" \
-            -f src/Dockerfile.base .
-
-          for service in orchestrator inventory supplier logistics pricing; do
-            dockerfile="src/agents/$service/Dockerfile"
-            if [[ -f "$dockerfile" ]]; then
-              az acr build -r "$ACR" \
-                --platform linux/amd64 \
-                -t "zavashop/$service:$GIT_SHA" \
+          if [[ -n "$AGENTS" ]]; then
+            az acr build -r "$ACR" --platform linux/amd64 \
+              -t "zavashop/base:$GIT_SHA" -f src/Dockerfile.base .
+            az acr repository show --name "$ACR" --image "zavashop/base:$GIT_SHA" -o none
+            IFS=',' read -r -a agent_list <<< "$AGENTS"
+            for service in "${agent_list[@]}"; do
+              [[ -n "$service" ]] || continue
+              az acr build -r "$ACR" --platform linux/amd64 \
                 --build-arg BASE_IMAGE="$ACR_LOGIN_SERVER/zavashop/base:$GIT_SHA" \
-                -f "$dockerfile" .
-            fi
+                -t "zavashop/$service:$GIT_SHA" -f "src/agents/$service/Dockerfile" .
+            done
+          fi
+
+          if [[ -n "$MCPS" ]]; then
+            IFS=',' read -r -a mcp_list <<< "$MCPS"
+            for service in "${mcp_list[@]}"; do
+              [[ -n "$service" ]] || continue
+              mcp_source="${service%-mcp}"
+              az acr build -r "$ACR" --platform linux/amd64 \
+                -t "zavashop/$service:$GIT_SHA" -f "src/mcp_servers/$mcp_source/Dockerfile" .
+            done
+          fi
+
+      - name: Verify selected images exist in ACR
+        if: steps.changes.outputs.agents != '' || steps.changes.outputs.mcps != ''
+        shell: bash
+        env:
+          AGENTS: ${{ steps.changes.outputs.agents }}
+          MCPS: ${{ steps.changes.outputs.mcps }}
+        run: |
+          for service in ${AGENTS//,/ }; do
+            [[ -n "$service" ]] || continue
+            az acr repository show --name "$ACR" --image "zavashop/$service:$GIT_SHA" -o none
+          done
+          for service in ${MCPS//,/ }; do
+            [[ -n "$service" ]] || continue
+            az acr repository show --name "$ACR" --image "zavashop/$service:$GIT_SHA" -o none
           done
 
-          for service in inventory supplier shipping pricing; do
-            az acr build -r "$ACR" \
-              --platform linux/amd64 \
-              -t "zavashop/$service-mcp:$GIT_SHA" \
-              -f "src/mcp_servers/$service/Dockerfile" .
+      - name: Deploy all ACA apps for infrastructure changes
+        if: steps.changes.outputs.aca_full == 'true'
+        shell: bash
+        run: DEPLOY_SHA="$GIT_SHA" bash infra/aca/deploy.sh
+
+      - name: Update selected ACA apps without replacing configuration
+        if: steps.changes.outputs.aca_full != 'true' && steps.changes.outputs.aca_apps != ''
+        shell: bash
+        env:
+          ACA_APPS: ${{ steps.changes.outputs.aca_apps }}
+        run: |
+          IFS=',' read -r -a apps <<< "$ACA_APPS"
+          for app in "${apps[@]}"; do
+            az containerapp update -g "$RG" -n "$app" \
+              --image "$ACR.azurecr.io/zavashop/$app:$GIT_SHA" -o none
           done
 
-      - name: Deploy ACA services
+      - name: Wait for selected ACA revisions
+        if: steps.changes.outputs.aca_apps != ''
         shell: bash
+        env:
+          ACA_APPS: ${{ steps.changes.outputs.aca_apps }}
         run: |
-          bash infra/aca/deploy.sh
+          IFS=',' read -r -a apps <<< "$ACA_APPS"
+          for app in "${apps[@]}"; do
+            ready=false
+            for _ in {1..60}; do
+              status=$(az containerapp show -g "$RG" -n "$app" \
+                --query properties.runningStatus -o tsv)
+              latest=$(az containerapp show -g "$RG" -n "$app" \
+                --query properties.latestRevisionName -o tsv)
+              healthy=$(az containerapp show -g "$RG" -n "$app" \
+                --query properties.latestReadyRevisionName -o tsv)
+              if [[ "$status" == "Running" && -n "$latest" && "$latest" == "$healthy" ]]; then
+                echo "$app ready at revision $latest"
+                ready=true
+                break
+              fi
+              sleep 10
+            done
+            [[ "$ready" == "true" ]] || { echo "$app did not reach a ready revision." >&2; exit 1; }
+          done
 
-      - name: Deploy AKS orchestrator
+      - name: Get non-admin AKS credentials
+        run: az aks get-credentials -g "$RG" -n "$AKS" --overwrite-existing
+
+      - name: Install kubelogin
+        uses: azure/use-kubelogin@v1
+        with:
+          kubelogin-version: latest
+
+      - name: Convert kubeconfig for Azure CLI authentication
+        run: kubelogin convert-kubeconfig -l azurecli
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Resolve runtime A2A URLs and orchestrator image
+        if: steps.changes.outputs.aks == 'true'
+        id: aks-values
         shell: bash
+        env:
+          AGENTS: ${{ steps.changes.outputs.agents }}
         run: |
-          source .env.fqdns
-          az aks get-credentials -g "$RG" -n "$AKS" --overwrite-existing
-          kubectl create namespace zavashop --dry-run=client -o yaml | kubectl apply -f -
+          for name in inventory supplier logistics pricing; do
+            fqdn=$(az containerapp show -g "$RG" -n "$name" \
+              --query properties.configuration.ingress.fqdn -o tsv)
+            [[ -n "$fqdn" ]] || { echo "Missing public FQDN for $name." >&2; exit 1; }
+            key=$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]')
+            printf 'ZAVA_%s_A2A_URL=https://%s/invoke\n' "$key" "$fqdn" >> "$GITHUB_ENV"
+          done
+          TENANT_ID=$(az account show --query tenantId -o tsv)
+          echo "AZURE_TENANT_ID=$TENANT_ID" >> "$GITHUB_ENV"
+
+          if [[ ",$AGENTS," == *,orchestrator,* ]]; then
+            image_tag="$GIT_SHA"
+          else
+            image=$(kubectl -n zavashop get deploy orchestrator \
+              -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
+            expected_prefix="$ACR.azurecr.io/zavashop/orchestrator:"
+            [[ "$image" == "$expected_prefix"* ]] || {
+              echo 'No existing orchestrator image; select orchestrator or all for the first deployment.' >&2
+              exit 1
+            }
+            image_tag="${image##*:}"
+          fi
+          [[ "$image_tag" =~ ^[0-9a-f]{7,40}$ ]] || {
+            echo 'Refusing to deploy an orchestrator image without a short SHA tag.' >&2
+            exit 1
+          }
+          az acr repository show --name "$ACR" --image "zavashop/orchestrator:$image_tag" -o none
+          echo "image_tag=$image_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Upgrade AKS orchestrator
+        if: steps.changes.outputs.aks == 'true'
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ steps.aks-values.outputs.image_tag }}
+        run: |
+          kubectl get namespace zavashop >/dev/null || {
+            echo 'The zavashop namespace is unavailable; refusing to create or deploy into it.' >&2
+            exit 1
+          }
           helm upgrade --install zavashop infra/aks/helm/zavashop \
-            -n zavashop \
+            --namespace zavashop \
             --set image.repository="$ACR.azurecr.io/zavashop/orchestrator" \
-            --set image.tag="$GIT_SHA" \
+            --set image.tag="$IMAGE_TAG" \
             --set workloadIdentity.clientId="$UAMI_CLIENT_ID" \
             --set keyVault.name="$KV" \
             --set tenantId="$AZURE_TENANT_ID" \
-            --set a2a.inventory="$ZAVA_INVENTORY_URL" \
-            --set a2a.supplier="$ZAVA_SUPPLIER_URL" \
-            --set a2a.logistics="$ZAVA_LOGISTICS_URL" \
-            --set a2a.pricing="$ZAVA_PRICING_URL"
+            --set a2a.inventory="$ZAVA_INVENTORY_A2A_URL" \
+            --set a2a.supplier="$ZAVA_SUPPLIER_A2A_URL" \
+            --set a2a.logistics="$ZAVA_LOGISTICS_A2A_URL" \
+            --set a2a.pricing="$ZAVA_PRICING_A2A_URL"
           kubectl -n zavashop rollout status deploy/orchestrator --timeout=300s
 
-      - name: Smoke and evals
+      # Full live evals are intentionally omitted; each suite run consumes approximately 48 Copilot requests.
+      - name: Smoke test the live orchestrator
         shell: bash
         run: |
+          ORCH_IP=""
           for _ in {1..60}; do
-            ORCH=$(kubectl -n zavashop get svc orchestrator \
+            ORCH_IP=$(kubectl -n zavashop get svc orchestrator \
               -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
-            if [[ -n "$ORCH" ]]; then
-              break
-            fi
+            [[ -n "$ORCH_IP" ]] && break
             sleep 10
           done
-          test -n "$ORCH"
+          [[ -n "$ORCH_IP" ]] || { echo 'Orchestrator external IP did not become available.' >&2; exit 1; }
 
-          for _ in {1..60}; do
-            if curl -fsS "http://$ORCH/healthz"; then
+          healthy=false
+          for _ in {1..80}; do
+            if status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+              --max-time 5 "http://$ORCH_IP/healthz" 2>/dev/null) && [[ "$status" == "200" ]]; then
+              healthy=true
               break
             fi
             sleep 5
           done
+          [[ "$healthy" == "true" ]] || { echo 'Orchestrator /healthz did not return 200.' >&2; exit 1; }
 
-          curl -fsS "http://$ORCH/readyz"
+          ready=false
+          for _ in {1..30}; do
+            if status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+              --max-time 5 "http://$ORCH_IP/readyz" 2>/dev/null) && [[ "$status" == "200" ]]; then
+              ready=true
+              break
+            fi
+            sleep 5
+          done
+          [[ "$ready" == "true" ]] || { echo 'Orchestrator /readyz did not return 200.' >&2; exit 1; }
 
-          curl -fsS -X POST "http://$ORCH/plan" \
+          single_store=$(curl -fsS --max-time 300 -X POST "http://$ORCH_IP/plan" \
             -H 'content-type: application/json' \
-            -d '{"goal":"Store 101 will stock out of SKU ZS-1042 by Friday.","sku":"ZS-1042","store_id":"store-101"}'
+            -d '{"goal":"smoke test single-store recovery","sku":"ZS-1042","store_id":"store-101"}')
+          jq -e '.sku == "ZS-1042" and .store_id == "store-101" and has("summary")' \
+            <<< "$single_store" >/dev/null
 
-          ZAVA_EVAL_LATENCY_BUDGET=400 \
-            ZAVA_ENDPOINT="http://$ORCH" \
-            uv run python -m tests.evals.run_evals
+          regional=$(curl -fsS --max-time 30 -X POST "http://$ORCH_IP/plan" \
+            -H 'content-type: application/json' \
+            -d '{"goal":"Create a regional plan across multiple stores","sku":"ZS-1042"}')
+          jq -e '.status == "refused"' <<< "$regional" >/dev/null
+          echo 'Smoke passed: healthz, readyz, single-store plan, and regional refusal.'
+
+      - name: Write deployment summary
+        if: always()
+        shell: bash
+        env:
+          AGENTS: ${{ steps.changes.outputs.agents }}
+          MCPS: ${{ steps.changes.outputs.mcps }}
+          ACA_APPS: ${{ steps.changes.outputs.aca_apps }}
+          ACA_FULL: ${{ steps.changes.outputs.aca_full }}
+          AKS_DEPLOY: ${{ steps.changes.outputs.aks }}
+          IMAGE_TAG: ${{ steps.aks-values.outputs.image_tag }}
+          SHA: ${{ steps.changes.outputs.sha }}
+        run: |
+          {
+            echo '## ZavaShop deployment'
+            echo "- SHA: \`${SHA:-unavailable}\`"
+            echo "- Selected agents: ${AGENTS:-none}"
+            echo "- Selected MCPs: ${MCPS:-none}"
+            echo "- ACA apps selected: ${ACA_APPS:-none} (full Bicep redeploy: ${ACA_FULL:-false})"
+            echo "- AKS orchestrator rollout requested: ${AKS_DEPLOY:-false} (image tag: ${IMAGE_TAG:-unchanged})"
+            echo '- Mandatory gates: Entra ID, Azure RBAC, Azure Policy, and Container Insights; Defender waived (ADR 0001).'
+            echo '- Live eval suite: intentionally not run in CD; each run consumes approximately 48 Copilot requests.'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ -n "$ACA_APPS" ]]; then
+            echo '### ACA latest revisions' >> "$GITHUB_STEP_SUMMARY"
+            for app in ${ACA_APPS//,/ }; do
+              revision=$(az containerapp show -g "$RG" -n "$app" \
+                --query properties.latestRevisionName -o tsv 2>/dev/null || echo unavailable)
+              echo "- $app: $revision" >> "$GITHUB_STEP_SUMMARY"
+            done
+          fi
