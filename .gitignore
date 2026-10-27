@@ -432,3 +432,6 @@ FodyWeavers.xsd
 
 # macOS
 **/.DS_Store
+.env.lab
+.env.region
+.env

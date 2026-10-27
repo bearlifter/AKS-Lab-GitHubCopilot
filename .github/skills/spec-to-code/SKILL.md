@@ -1,9 +1,8 @@
 ---
-mode: agent
-description: Drive an existing spec (specs/*.md) through code + tests in one PR.
-tools: ['search/codebase', 'search', 'edit/editFiles', 'execute/runInTerminal', 'execute/getTerminalOutput', 'findTestFiles', 'read/problems']
+name: spec-to-code
+description: "Drive an existing spec (specs/*.md) through code + tests in one PR."
+disable-model-invocation: true
 ---
-
 # Workflow: Spec → Code → Tests
 
 ## Inputs

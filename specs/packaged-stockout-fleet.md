@@ -2,7 +2,7 @@
 
 ## Goal
 
-Build the ZavaShop stock-out response application as a packaged, deployable fleet. Generate five MAF agents, four MCP servers, tests, Docker packaging, and deployment handoff artifacts so a store stock-out goal can be answered locally and then shipped to AKS plus Azure Container Apps through `/ship-it`.
+Build the ZavaShop stock-out response application as a packaged, deployable fleet of five Microsoft Agent Framework agents and four MCP servers. Make the full fleet testable and runnable locally with Docker, and provide deployment handoff artifacts that target AKS for the orchestrator and Azure Container Apps for the four specialists and four MCP servers. Prepare the final artifacts for the separate `/ship-it` deployment workflow; do not deploy cloud resources during implementation.
 
 ## Non-goals
 
@@ -226,21 +226,21 @@ class FleetPackage(BaseModel):
 3. The supplier MCP server can list suppliers for `ZS-1042` and draft a purchase order with a stable `po_id`, quantity, supplier, ETA, and estimated total.
 4. The shipping MCP server can quote shipment for the drafted purchase order and destination store using a typed `ShipmentQuote`.
 5. The pricing MCP server can recommend a price for `ZS-1042` at `store-101` using demand signal and stock risk level.
-6. Each specialist agent uses `GitHubCopilotAgent` with `GitHubCopilotOptions(model=settings.copilot_model, timeout=settings.copilot_timeout_seconds, on_permission_request=_approve_all, mcp_servers={...})` and refuses out-of-scope domain questions.
+6. All five agents use `GitHubCopilotAgent` from `agent_framework.github`, created with `client=build_copilot_client()` and `GitHubCopilotOptions(model="gpt-5.5", timeout=settings.copilot_timeout_seconds, on_permission_request=_approve_all, mcp_servers={...})`; each agent has a role-scoped system prompt and refuses out-of-scope requests.
 7. The orchestrator communicates with specialists only through A2A HTTP calls and does not import specialist Python modules.
 8. External I/O lives in MCP servers; agent `tools.py` files do not contain database, supplier API, shipping API, or pricing-engine side effects.
-9. Docker packaging produces one base image plus nine service images, all tagged with the git SHA and never `latest`.
-10. Docker Compose can run the full local fleet with health checks for all five agents and four MCP servers.
-11. The deployment handoff includes AKS Helm requirements for the orchestrator and ACA Bicep requirements for all four specialists plus all four MCP servers.
-12. Tests include unit tests for contracts, MCP tool tests, A2A integration tests, and eval scenarios; `uv run poe check` passes before `/ship-it`.
-13. Cloud deployment remains gated by Lab 05 landing zone checks: Entra ID, Azure RBAC, Workload Identity, Azure Policy, Container Insights, Defender for Cloud, Key Vault CSI, and git-SHA image tags.
+9. Docker packaging builds one Python base image and nine service images (five agents and four MCP servers), all tagged with the current git SHA; no manifest or deployment helper references `:latest`.
+10. Docker Compose starts the orchestrator, four specialists, and four MCP servers as one local fleet, with health checks and the required service endpoints; `docker compose up -d --build` completes successfully.
+11. Deployment handoff artifacts specify the AKS Helm target for the orchestrator and ACA deployment target for all four specialists and all four MCP servers, with internal service communication and configured MCP/A2A endpoints.
+12. Unit, MCP, A2A integration, and eval tests cover the acceptance criteria. `uv run poe check` passes, and `ZAVA_ENDPOINT=http://localhost:8000 uv run python -m tests.evals.run_evals` reports no failures before the final `/ship-it` handoff.
+13. Cloud deployment is left to `/ship-it` and gated by the Lab 05 landing-zone checks: Entra ID, Azure RBAC, Workload Identity, Azure Policy, Container Insights, Defender for Cloud, Key Vault CSI, and git-SHA image tags.
 
 ## Eval scenarios
 
 ```jsonl
-{"id":"stockout-zs1042-store101","goal":"Store 101 will stock out of SKU ZS-1042 by Friday. Build a recovery plan for store-101.","must_mention":["ZS-1042","store-101","stock","purchase order","shipping","price"],"must_call":["inventory","supplier","logistics","pricing"],"forbid_call":[],"max_latency_s":120}
+{"id":"stockout-zs1042-store101","goal":"Store 101 will stock out of SKU ZS-1042 by Friday. Build a recovery plan for store-101.","sku":"ZS-1042","store_id":"store-101","must_mention":["ZS-1042","store-101","stock","purchase order","shipping","price"],"must_call":["inventory","supplier","logistics","pricing"],"forbid_call":[],"max_latency_s":180}
 {"id":"stockout-no-regional-plan","goal":"The Northeast region may stock out of ZS-1042. Build a regional recovery plan.","must_mention":["single store","store_id","refuse"],"must_call":[],"forbid_call":["supplier","logistics","pricing"],"max_latency_s":60}
-{"id":"stockout-transfer-and-po","goal":"For SKU ZS-1042 at store-101, compare nearby stock with supplier replenishment and produce the best action plan.","must_mention":["store-202","wh-east","supplier","ETA","next actions"],"must_call":["inventory","supplier","logistics"],"forbid_call":[],"max_latency_s":120}
+{"id":"stockout-transfer-and-po","goal":"For SKU ZS-1042 at store-101, compare nearby stock with supplier replenishment and produce the best action plan.","sku":"ZS-1042","store_id":"store-101","must_mention":["store-202","wh-east","supplier","ETA","next_actions"],"must_call":["inventory","supplier","logistics"],"forbid_call":[],"max_latency_s":180}
 ```
 
 ## Out of scope for this iteration
@@ -263,5 +263,9 @@ src/mcp_servers/inventory, src/mcp_servers/supplier,
 src/mcp_servers/shipping, and src/mcp_servers/pricing.
 Use the Pydantic contracts from the spec, seed ZS-1042/store-101/store-202/wh-east,
 keep stores in memory with TODO comments for Cosmos DB, expose FastMCP streamable-http
-servers, and run the MCP-focused checks before reporting.
+servers, and run the MCP-focused checks before reporting. Stop after this MCP phase for
+human review; do not proceed to agents, tests, or deployment without the next mode being
+explicitly invoked. Once all implementation and verification phases are complete, leave
+the fleet ready for the separate `/ship-it` handoff to deploy the orchestrator to AKS and
+the specialists and MCP servers to ACA.
 ```

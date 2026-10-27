@@ -1,8 +1,8 @@
 ---
-mode: agent
-description: (Deprecated — use `agent-builder` agent instead.) Redirector kept for back-compat.
+name: new-agent
+description: "(Deprecated — use `agent-builder` agent instead.) Redirector kept for back-compat."
+disable-model-invocation: true
 ---
-
 # Deprecated
 
 This slash prompt has been replaced by the **`agent-builder`** custom agent.

@@ -1,9 +1,8 @@
 ---
-mode: agent
-description: End-to-end ZavaShop workflow — turn a GitHub issue into a merged, deployed PR using the custom agents.
-tools: ['codebase', 'search', 'usages', 'editFiles', 'runCommands', 'findTestFiles', 'problems', 'githubRepo', 'fetch']
+name: feature-from-issue
+description: "End-to-end ZavaShop workflow — turn a GitHub issue into a merged, deployed PR using the custom agents."
+disable-model-invocation: true
 ---
-
 # Workflow: Feature from Issue → Deployed PR
 
 You are running the **full ZavaShop delivery loop** for one GitHub issue. You will invoke a different agent at each phase. **At every handoff, stop and ask the human to /-invocation the next agent** — do not silently impersonate other agents.

@@ -1,9 +1,8 @@
 ---
-mode: agent
-description: Package and roll the current SHA to ACR + ACA + AKS, with quality, landing zone, and smoke gates.
-tools: ['codebase', 'runCommands', 'editFiles']
+name: ship-it
+description: "Package and roll the current SHA to ACR + ACA + AKS, with quality, landing zone, and smoke gates."
+disable-model-invocation: true
 ---
-
 # Workflow: Ship It
 
 ## Inputs
