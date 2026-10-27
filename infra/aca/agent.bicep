@@ -9,7 +9,7 @@ param mcpEndpoints object = {}
 param exposeIngress bool = false
 param keyVaultName string
 param targetPort int = 8000
-param minReplicas int = 1
+param minReplicas int = 0
 param location string = resourceGroup().location
 
 var secretName = 'github-token'

@@ -5,8 +5,10 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
 DEPLOY_CAE="${DEPLOY_CAE:-}"
-source .env.lab
-CAE="${DEPLOY_CAE:-$CAE}"
+if [[ -f .env.lab ]]; then
+  source .env.lab
+fi
+CAE="${DEPLOY_CAE:-${CAE:-}}"
 
 : "${RG:?missing RG}"
 : "${ACR:?missing ACR}"
@@ -43,7 +45,7 @@ deploy_app() {
     -p targetPort="$target_port" \
     -p mcpEndpoints="$mcp_json" \
     -p exposeIngress=true \
-    -p minReplicas=1 \
+    -p minReplicas=0 \
     -o none
 
   local fqdn
