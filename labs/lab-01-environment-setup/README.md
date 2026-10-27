@@ -231,6 +231,7 @@ az provider register -n Microsoft.App --wait
 
 az containerapp env create \
   -n $CAE -g $RG -l $LOCATION \
+  --environment-mode WorkloadProfiles \
   --logs-destination none \
   --tags project=zavashop lab=01
 ```

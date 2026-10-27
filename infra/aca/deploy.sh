@@ -4,7 +4,9 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
+DEPLOY_CAE="${DEPLOY_CAE:-}"
 source .env.lab
+CAE="${DEPLOY_CAE:-$CAE}"
 
 : "${RG:?missing RG}"
 : "${ACR:?missing ACR}"
