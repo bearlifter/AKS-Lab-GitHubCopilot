@@ -2,7 +2,7 @@
 
 ## Goal
 
-Build the ZavaShop stock-out response application as a packaged, deployable fleet of five Microsoft Agent Framework agents and four MCP servers. Make the full fleet testable and runnable locally with Docker, and provide deployment handoff artifacts that target AKS for the orchestrator and Azure Container Apps for the four specialists and four MCP servers. Prepare the final artifacts for the separate `/ship-it` deployment workflow; do not deploy cloud resources during implementation.
+Build a runnable ZavaShop fleet of five Microsoft Agent Framework agents and four MCP servers for one stock-out workflow identified by a SKU and store. Make the orchestrator's `POST /plan` accept the goal, SKU, and store ID and return a structured `Plan` with `stock_view`, `price_view`, `po_view`, `shipping_view`, and `summary` as top-level fields. Package and test the fleet locally, and prepare AKS/ACA deployment handoff artifacts without deploying cloud resources.
 
 ## Non-goals
 
@@ -23,10 +23,10 @@ Build the ZavaShop stock-out response application as a packaged, deployable flee
 ## Affected agents
 
 - [x] `orchestrator` — owns the `/plan` workflow, A2A fan-out, final `Plan`, local compose wiring, and AKS-facing service.
-- [x] `inventory` — owns stock-risk interpretation using the inventory MCP server.
-- [x] `supplier` — owns supplier availability and purchase-order draft recommendations using the supplier MCP server.
-- [x] `logistics` — owns shipment quoting and transfer guidance using the shipping MCP server.
-- [x] `pricing` — owns price recommendation using the pricing MCP server.
+- [x] `inventory` — serves its specialist A2A `/invoke` endpoint, interprets stock risk using the inventory MCP server, and returns its result to the orchestrator over A2A.
+- [x] `supplier` — serves its specialist A2A `/invoke` endpoint, gets supplier availability and purchase-order drafts from the supplier MCP server, and returns its result to the orchestrator over A2A.
+- [x] `logistics` — serves its specialist A2A `/invoke` endpoint, gets shipment quotes and transfer guidance from the shipping MCP server, and returns its result to the orchestrator over A2A.
+- [x] `pricing` — serves its specialist A2A `/invoke` endpoint, gets price recommendations from the pricing MCP server, and returns its result to the orchestrator over A2A.
 - [x] MCP server `inventory` — exposes `check_stock(StockQuery) -> StockReport`.
 - [x] MCP server `supplier` — exposes `list_suppliers(SupplierQuery) -> SupplierList` and `draft_po(PurchaseOrderRequest) -> PurchaseOrderDraft`.
 - [x] MCP server `shipping` — exposes `quote_shipment(ShipmentQuoteRequest) -> ShipmentQuote`.
@@ -41,11 +41,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class Goal(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
-    goal: str = Field(min_length=1)
-    sku: str = Field(min_length=1)
-    store_id: str = Field(min_length=1)
+    goal: str = Field(min_length=1, max_length=4000)
+    sku: str = Field(min_length=1, max_length=128)
+    store_id: str = Field(min_length=1, max_length=128)
 ```
 
 ```python
@@ -179,20 +179,20 @@ class PriceRecommendation(BaseModel):
 ```
 
 ```python
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class Plan(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
-    sku: str
-    store_id: str
-    stock_view: str
-    price_view: str
-    po_view: str
-    shipping_view: str
-    summary: str
-    next_actions: list[str]
+    sku: str = Field(min_length=1)
+    store_id: str = Field(min_length=1)
+    stock_view: str = Field(min_length=1)
+    price_view: str = Field(min_length=1)
+    po_view: str = Field(min_length=1)
+    shipping_view: str = Field(min_length=1)
+    summary: str = Field(min_length=1)
+    next_actions: list[str] = Field(min_length=1)
 ```
 
 ```python
@@ -221,7 +221,7 @@ class FleetPackage(BaseModel):
 
 ## Acceptance criteria
 
-1. Given `sku="ZS-1042"` and `store_id="store-101"`, the orchestrator `/plan` endpoint returns a frozen `Plan` containing `stock_view`, `price_view`, `po_view`, `shipping_view`, `summary`, and `next_actions`.
+1. Given a valid `Goal` containing `goal`, `sku="ZS-1042"`, and `store_id="store-101"`, `POST /plan` returns HTTP 200 with a JSON object validated as `Plan` directly (not nested under an `output` or other wrapper). The response contains non-empty top-level `stock_view`, `price_view`, `po_view`, `shipping_view`, and `summary` fields, plus the identifying `sku`, `store_id`, and at least one `next_actions` item.
 2. The inventory MCP server returns a `StockReport` for `ZS-1042` with `store-101`, `store-202`, and `wh-east` represented in the seeded in-memory data.
 3. The supplier MCP server can list suppliers for `ZS-1042` and draft a purchase order with a stable `po_id`, quantity, supplier, ETA, and estimated total.
 4. The shipping MCP server can quote shipment for the drafted purchase order and destination store using a typed `ShipmentQuote`.
@@ -238,8 +238,7 @@ class FleetPackage(BaseModel):
 ## Eval scenarios
 
 ```jsonl
-{"id":"stockout-zs1042-store101","goal":"Store 101 will stock out of SKU ZS-1042 by Friday. Build a recovery plan for store-101.","sku":"ZS-1042","store_id":"store-101","must_mention":["ZS-1042","store-101","stock","purchase order","shipping","price"],"must_call":["inventory","supplier","logistics","pricing"],"forbid_call":[],"max_latency_s":180}
-{"id":"stockout-no-regional-plan","goal":"The Northeast region may stock out of ZS-1042. Build a regional recovery plan.","must_mention":["single store","store_id","refuse"],"must_call":[],"forbid_call":["supplier","logistics","pricing"],"max_latency_s":60}
+{"id":"stockout-zs1042-store101-structured-plan","goal":"Store 101 will stock out of SKU ZS-1042 by Friday. Build a recovery plan for this SKU and store.","sku":"ZS-1042","store_id":"store-101","must_mention":["ZS-1042","store-101","stock_view","price_view","po_view","shipping_view","summary"],"must_call":["inventory","supplier","logistics","pricing"],"forbid_call":[],"max_latency_s":180}
 {"id":"stockout-transfer-and-po","goal":"For SKU ZS-1042 at store-101, compare nearby stock with supplier replenishment and produce the best action plan.","sku":"ZS-1042","store_id":"store-101","must_mention":["store-202","wh-east","supplier","ETA","next_actions"],"must_call":["inventory","supplier","logistics"],"forbid_call":[],"max_latency_s":180}
 ```
 
