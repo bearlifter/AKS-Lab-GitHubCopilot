@@ -131,7 +131,9 @@ services:
       dockerfile: src/agents/orchestrator/Dockerfile
       args:
         BASE_IMAGE: zavashop-base:${GIT_SHA:?set GIT_SHA to the current git SHA}
-    environment: *agent-env
+    environment:
+      <<: *agent-env
+      ZAVA_KV_URL: ${ZAVA_KV_URL:-}
     depends_on:
       inventory:
         condition: service_healthy

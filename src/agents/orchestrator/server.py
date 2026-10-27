@@ -2,21 +2,42 @@
 
 from __future__ import annotations
 
-from fastapi import FastAPI
+import structlog
+from fastapi import FastAPI, HTTPException
 
+from src.shared.keyvault import hydrate_key_vault_secrets
 from src.shared.server import make_app
 from src.shared.settings import Settings
 
-from .a2a import SpecialistClient, SpecialistInvoker, call_specialists
+from .a2a import SpecialistClient, SpecialistInvoker
 from .agent import build_agent
 from .contracts import Goal, Plan, PlanRefusal
+from .workflow import run_plan_workflow
+
+log = structlog.get_logger(__name__)
+
+
+async def _build_with_key_vault(settings: Settings):
+    hydrated = await hydrate_key_vault_secrets(settings.kv_url)
+    environment_settings = {
+        "ZAVA_INVENTORY_MCP_URL": "inventory_mcp_url",
+        "ZAVA_SUPPLIER_MCP_URL": "supplier_mcp_url",
+        "ZAVA_SHIPPING_MCP_URL": "shipping_mcp_url",
+        "ZAVA_PRICING_MCP_URL": "pricing_mcp_url",
+    }
+    updates = {
+        field_name: hydrated[environment_name]
+        for environment_name, field_name in environment_settings.items()
+        if environment_name in hydrated
+    }
+    return await build_agent(settings.model_copy(update=updates))
 
 
 def create_app(settings: Settings | None = None, specialist_client: SpecialistInvoker | None = None) -> FastAPI:
-    """Create the orchestrator app with /invoke and /plan endpoints."""
+    """Create the orchestrator app with /invoke and deterministic /plan endpoints."""
 
     app_settings = settings or Settings()
-    app = make_app(name="orchestrator", build=build_agent, settings=app_settings)
+    app = make_app(name="orchestrator", build=_build_with_key_vault, settings=app_settings)
     client = specialist_client or SpecialistClient(settings=app_settings)
 
     @app.post("/plan", response_model=Plan | PlanRefusal)
@@ -24,24 +45,16 @@ def create_app(settings: Settings | None = None, specialist_client: SpecialistIn
         if goal.store_id is None:
             return PlanRefusal(reason="A recovery plan requires a single store; provide store_id.")
 
-        outputs = await call_specialists(client=client, sku=goal.sku, store_id=goal.store_id)
-        return Plan(
-            sku=goal.sku,
-            store_id=goal.store_id,
-            stock_view=outputs.inventory,
-            po_view=outputs.supplier,
-            shipping_view=outputs.logistics,
-            price_view=outputs.pricing,
-            summary=(
-                f"Recovery plan for {goal.sku} at {goal.store_id}: protect stock, place replenishment, "
-                "ship quickly, and tune price during the stock-out window."
-            ),
-            next_actions=[
-                "Approve the recommended replenishment purchase order.",
-                "Book the recommended shipment to the target store.",
-                "Apply the price recommendation until stock risk clears.",
-            ],
-        )
+        try:
+            return await run_plan_workflow(
+                client=client,
+                goal=goal.goal,
+                sku=goal.sku,
+                store_id=goal.store_id,
+            )
+        except Exception as exc:
+            log.error("orchestrator.plan.failed", error_type=type(exc).__name__)
+            raise HTTPException(status_code=502, detail="Plan workflow failed") from exc
 
     app.state.plan_endpoint = plan
 

@@ -5,6 +5,8 @@ RUN python -m pip install --no-cache-dir uv
 RUN uv pip install --system \
     agent-framework-core \
     agent-framework-github-copilot \
+    azure-identity==1.27.0 \
+    azure-keyvault-secrets==4.11.3 \
     fastapi \
     httpx \
     mcp \
