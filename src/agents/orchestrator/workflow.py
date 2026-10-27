@@ -198,7 +198,7 @@ def build_plan_workflow(client: SpecialistInvoker) -> Workflow:
 
     return (
         WorkflowBuilder(start_executor=start, output_from=[reconcile])
-        .add_fan_out_edges(start, [inventory])
+        .add_fan_out_edges(start, [inventory, pricing])
         .add_fan_in_edges([inventory, pricing], supplier)
         .add_chain([supplier, logistics, reconcile])
         .build()
