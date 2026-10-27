@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -12,7 +14,7 @@ class Goal(BaseModel):
 
     goal: str = Field(min_length=1, description="Natural-language stock-out recovery goal.")
     sku: str = Field(min_length=1, description="SKU to recover.")
-    store_id: str = Field(min_length=1, description="Target store identifier.")
+    store_id: str | None = Field(default=None, description="Target store identifier for a single-store plan.")
 
 
 class Plan(BaseModel):
@@ -28,3 +30,12 @@ class Plan(BaseModel):
     shipping_view: str
     summary: str
     next_actions: list[str]
+
+
+class PlanRefusal(BaseModel):
+    """Typed refusal for requests outside the single-store planning scope."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    status: Literal["refused"] = "refused"
+    reason: str = Field(min_length=1)

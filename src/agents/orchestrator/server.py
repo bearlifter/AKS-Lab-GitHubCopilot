@@ -9,7 +9,7 @@ from src.shared.settings import Settings
 
 from .a2a import SpecialistClient, SpecialistInvoker, call_specialists
 from .agent import build_agent
-from .contracts import Goal, Plan
+from .contracts import Goal, Plan, PlanRefusal
 
 
 def create_app(settings: Settings | None = None, specialist_client: SpecialistInvoker | None = None) -> FastAPI:
@@ -19,8 +19,11 @@ def create_app(settings: Settings | None = None, specialist_client: SpecialistIn
     app = make_app(name="orchestrator", build=build_agent, settings=app_settings)
     client = specialist_client or SpecialistClient(settings=app_settings)
 
-    @app.post("/plan", response_model=Plan)
-    async def plan(goal: Goal) -> Plan:
+    @app.post("/plan", response_model=Plan | PlanRefusal)
+    async def plan(goal: Goal) -> Plan | PlanRefusal:
+        if goal.store_id is None:
+            return PlanRefusal(reason="A recovery plan requires a single store; provide store_id.")
+
         outputs = await call_specialists(client=client, sku=goal.sku, store_id=goal.store_id)
         return Plan(
             sku=goal.sku,

@@ -7,7 +7,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
@@ -23,11 +23,12 @@ class EvalScenario(BaseModel):
     id: str = Field(min_length=1)
     goal: str = Field(min_length=1)
     sku: str = Field(min_length=1)
-    store_id: str = Field(min_length=1)
+    store_id: str | None = Field(default=None, min_length=1)
     must_mention: list[str] = Field(default_factory=list)
     must_call: list[str] = Field(default_factory=list)
     forbid_call: list[str] = Field(default_factory=list)
     max_latency_s: float = Field(default=180, gt=0)
+    expected_status: Literal["plan", "refused"] = "plan"
 
 
 class EvalResult(BaseModel):
@@ -56,9 +57,13 @@ def _flatten_response(payload: dict[str, Any]) -> str:
 
 async def _run_one(client: httpx.AsyncClient, scenario: EvalScenario) -> EvalResult:
     started = time.perf_counter()
+    request_payload = {"goal": scenario.goal, "sku": scenario.sku}
+    if scenario.store_id is not None:
+        request_payload["store_id"] = scenario.store_id
     response = await client.post(
         "/plan",
-        json={"goal": scenario.goal, "sku": scenario.sku, "store_id": scenario.store_id},
+        json=request_payload,
+        timeout=scenario.max_latency_s + 30,
     )
     latency_s = time.perf_counter() - started
     response.raise_for_status()
@@ -66,6 +71,10 @@ async def _run_one(client: httpx.AsyncClient, scenario: EvalScenario) -> EvalRes
     flattened = _flatten_response(payload)
     missing_mentions = [term for term in scenario.must_mention if term.lower() not in flattened]
     notes: list[str] = []
+    expected_refusal = scenario.expected_status == "refused"
+    if (payload.get("status") == "refused") != expected_refusal:
+        actual_status = "refused" if payload.get("status") == "refused" else "plan"
+        notes.append(f"expected status {scenario.expected_status}, got {actual_status}")
     if scenario.must_call:
         notes.append(f"expected specialists: {','.join(scenario.must_call)}")
     if scenario.forbid_call:
@@ -75,7 +84,11 @@ async def _run_one(client: httpx.AsyncClient, scenario: EvalScenario) -> EvalRes
     budget = float(os.environ.get("ZAVA_EVAL_LATENCY_BUDGET", "0"))
     if budget > 0 and latency_s > budget:
         notes.append(f"latency {latency_s:.2f}s exceeded global budget {budget:.2f}s")
-    passed = not missing_mentions and all("exceeded" not in note for note in notes)
+    passed = (
+        not missing_mentions
+        and not any(note.startswith("expected status") for note in notes)
+        and all("exceeded" not in note for note in notes)
+    )
     return EvalResult(
         id=scenario.id,
         passed=passed,
@@ -89,8 +102,20 @@ async def run() -> int:
     endpoint = os.environ.get("ZAVA_ENDPOINT", "http://localhost:8000").rstrip("/")
     scenarios = _load_scenarios()
     failures = 0
-    timeout = httpx.Timeout(240.0)
+    timeout = httpx.Timeout(max(scenario.max_latency_s for scenario in scenarios) + 30)
     async with httpx.AsyncClient(base_url=endpoint, timeout=timeout) as client:
+        ready_response = await client.get("/readyz")
+        ready_response.raise_for_status()
+        warmup_scenario = next((scenario for scenario in scenarios if scenario.store_id is not None), scenarios[0])
+        warmup_payload = {"goal": warmup_scenario.goal, "sku": warmup_scenario.sku}
+        if warmup_scenario.store_id is not None:
+            warmup_payload["store_id"] = warmup_scenario.store_id
+        warmup_response = await client.post(
+            "/plan",
+            json=warmup_payload,
+            timeout=warmup_scenario.max_latency_s + 30,
+        )
+        warmup_response.raise_for_status()
         for scenario in scenarios:
             result = await _run_one(client, scenario)
             status = "PASS" if result.passed else "FAIL"
