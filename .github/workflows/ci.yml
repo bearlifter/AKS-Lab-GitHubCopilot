@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check and audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Run checks
+        run: uv run poe check
+
+      - name: Run security audit
+        run: uv run poe audit
+
+  evals:
+    name: Opt-in live evals
+    if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-evals')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Set short git SHA
+        id: sha
+        shell: bash
+        run: |
+          GIT_SHA=$(git rev-parse --short "$GITHUB_SHA")
+          echo "GIT_SHA=$GIT_SHA" >> "$GITHUB_ENV"
+
+      - name: Require Copilot credential
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          if [[ -z "$COPILOT_GITHUB_TOKEN" ]]; then
+            echo "COPILOT_GITHUB_TOKEN is required to run live evals." >&2
+            exit 1
+          fi
+
+      # Build the base before Compose so service builds do not pull it from Docker Hub.
+      - name: Build base image
+        run: docker build -t "zavashop-base:$GIT_SHA" -f src/Dockerfile.base .
+
+      - name: Build and start Compose fleet
+        env:
+          GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+        run: |
+          docker compose build
+          docker compose up -d --wait
+
+      # One run consumes approximately 48 Copilot requests.
+      - name: Run live evals
+        env:
+          GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+          ZAVA_ENDPOINT: http://localhost:8000
+        run: uv run poe evals
+
+      - name: Stop Compose fleet
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+        run: GITHUB_TOKEN="${GITHUB_TOKEN:-cleanup-only}" docker compose down
