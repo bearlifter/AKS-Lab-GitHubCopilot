@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from dataclasses import dataclass
 from http import HTTPStatus
 
@@ -126,6 +127,7 @@ async def test_plan_workflow_runs_stock_and_price_in_parallel_then_supplier_and_
     assert response.status_code == HTTPStatus.OK
     assert set(specialist_client.calls[:2]) == {"inventory", "pricing"}
     assert specialist_client.calls[2:] == ["supplier", "logistics"]
+    assert Counter(specialist_client.calls) == Counter({"inventory": 1, "pricing": 1, "supplier": 1, "logistics": 1})
 
 
 @pytest.mark.asyncio
@@ -147,3 +149,29 @@ async def test_plan_workflow_failure_is_explicit() -> None:
 
     assert response.status_code == HTTPStatus.BAD_GATEWAY
     assert response.json() == {"detail": "Plan workflow failed"}
+
+
+@pytest.mark.asyncio
+async def test_plan_workflow_replays_deterministically_for_same_outputs() -> None:
+    settings = Settings()
+    specialist_client = RecordingSpecialistClient(settings=settings)
+    app = create_app(settings=settings, specialist_client=specialist_client)
+    transport = ASGITransport(app=app)
+    payload = {
+        "goal": "Recover SKU ZS-1042 at store-101",
+        "sku": "ZS-1042",
+        "store_id": "store-101",
+    }
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        first_response = await client.post("/plan", json=payload)
+        second_response = await client.post("/plan", json=payload)
+
+    assert first_response.status_code == HTTPStatus.OK
+    assert second_response.status_code == HTTPStatus.OK
+    first_plan = first_response.json()
+    second_plan = second_response.json()
+    assert first_plan == second_plan
+    assert first_plan["summary"] == second_plan["summary"]
+    assert first_plan["next_actions"] == second_plan["next_actions"]
+    assert Counter(specialist_client.calls) == Counter({"inventory": 2, "pricing": 2, "supplier": 2, "logistics": 2})
