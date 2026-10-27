@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
 
 import structlog
@@ -17,47 +16,29 @@ _SECRET_ENVIRONMENT_NAMES = {
     "PRICING-MCP-URL": "ZAVA_PRICING_MCP_URL",
 }
 
-_ENVIRONMENT_SETTINGS = {
-    "ZAVA_INVENTORY_MCP_URL": "inventory_mcp_url",
-    "ZAVA_SUPPLIER_MCP_URL": "supplier_mcp_url",
-    "ZAVA_SHIPPING_MCP_URL": "shipping_mcp_url",
-    "ZAVA_PRICING_MCP_URL": "pricing_mcp_url",
-}
 
+async def hydrate_from_keyvault() -> None:
+    """Hydrate unset environment variables from Key Vault when ZAVA_KV_URL is configured."""
 
-async def hydrate_key_vault_secrets(kv_url: str | None) -> dict[str, str]:
-    """Hydrate configured secrets from Key Vault, returning hydrated environment values."""
-
-    if not kv_url:
-        return {}
+    vault_url = os.environ.get("ZAVA_KV_URL")
+    if not vault_url:
+        return
 
     from azure.core.exceptions import ResourceNotFoundError  # noqa: PLC0415
-    from azure.identity import DefaultAzureCredential  # noqa: PLC0415
-    from azure.keyvault.secrets import SecretClient  # noqa: PLC0415
+    from azure.identity.aio import DefaultAzureCredential  # noqa: PLC0415
+    from azure.keyvault.secrets.aio import SecretClient  # noqa: PLC0415
 
-    def read_secrets() -> dict[str, str]:
-        credential = DefaultAzureCredential()
-        client = SecretClient(vault_url=kv_url, credential=credential)
-        hydrated: dict[str, str] = {}
-        try:
+    credential = DefaultAzureCredential()
+    async with credential:
+        async with SecretClient(vault_url=vault_url, credential=credential) as client:
             for secret_name, environment_name in _SECRET_ENVIRONMENT_NAMES.items():
-                if environment_name == "GITHUB_TOKEN" and os.getenv(environment_name):
+                if environment_name in os.environ:
                     continue
                 try:
-                    secret_value = client.get_secret(secret_name).value
+                    secret_value = (await client.get_secret(secret_name)).value
                 except ResourceNotFoundError:
                     log.warning("keyvault.secret.missing", secret_name=secret_name)
                     continue
                 if not secret_value:
                     raise ValueError(f"Key Vault secret {secret_name} has no value.")
                 os.environ[environment_name] = secret_value
-                hydrated[environment_name] = secret_value
-        except Exception:
-            log.exception("keyvault.hydration.failed")
-            raise
-        finally:
-            client.close()
-            credential.close()
-        return hydrated
-
-    return await asyncio.to_thread(read_secrets)

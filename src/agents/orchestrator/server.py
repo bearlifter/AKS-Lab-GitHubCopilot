@@ -5,7 +5,6 @@ from __future__ import annotations
 import structlog
 from fastapi import FastAPI, HTTPException
 
-from src.shared.keyvault import hydrate_key_vault_secrets
 from src.shared.server import make_app
 from src.shared.settings import Settings
 
@@ -17,27 +16,11 @@ from .workflow import run_plan_workflow
 log = structlog.get_logger(__name__)
 
 
-async def _build_with_key_vault(settings: Settings):
-    hydrated = await hydrate_key_vault_secrets(settings.kv_url)
-    environment_settings = {
-        "ZAVA_INVENTORY_MCP_URL": "inventory_mcp_url",
-        "ZAVA_SUPPLIER_MCP_URL": "supplier_mcp_url",
-        "ZAVA_SHIPPING_MCP_URL": "shipping_mcp_url",
-        "ZAVA_PRICING_MCP_URL": "pricing_mcp_url",
-    }
-    updates = {
-        field_name: hydrated[environment_name]
-        for environment_name, field_name in environment_settings.items()
-        if environment_name in hydrated
-    }
-    return await build_agent(settings.model_copy(update=updates))
-
-
 def create_app(settings: Settings | None = None, specialist_client: SpecialistInvoker | None = None) -> FastAPI:
     """Create the orchestrator app with /invoke and deterministic /plan endpoints."""
 
     app_settings = settings or Settings()
-    app = make_app(name="orchestrator", build=_build_with_key_vault, settings=app_settings)
+    app = make_app(name="orchestrator", build=build_agent, settings=app_settings)
     client = specialist_client or SpecialistClient(settings=app_settings)
 
     @app.post("/plan", response_model=Plan | PlanRefusal)
