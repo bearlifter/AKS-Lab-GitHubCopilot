@@ -11,7 +11,7 @@ dependencies = [
     "azure-keyvault-secrets>=4.11.3",
     "fastapi",
     "httpx",
-    "mcp",
+    "mcp>=1.30.0,<2",
     "opentelemetry-api",
     "opentelemetry-sdk",
     "pydantic>=2",
@@ -22,10 +22,13 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "bandit>=1.9.4",
+    "pip-audit>=2.10.1",
     "poethepoet",
     "pyright",
     "pytest",
     "pytest-asyncio",
+    "pytest-cov>=7.1.0",
     "ruff",
 ]
 
@@ -37,6 +40,14 @@ target-version = "py311"
 select = ["E", "F", "I", "B", "UP", "N", "ASYNC", "PL", "RUF"]
 ignore = ["PLR0913"]
 
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ANN401"]
+".github/scripts/diagnose_af.py" = ["PLC0415"]
+
+[tool.bandit]
+# MCP containers intentionally bind all interfaces; GITHUB-TOKEN is a Key Vault secret name.
+skips = ["B104", "B105"]
+
 [tool.pyright]
 pythonVersion = "3.11"
 typeCheckingMode = "strict"
@@ -47,4 +58,6 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 
 [tool.poe.tasks]
-check = { shell = "ruff check src tests && ruff format --check src tests && pyright src tests && pytest" }
+check = { shell = "ruff check . && ruff format --check . && pyright && pytest -q --cov=src/agents --cov-fail-under=80" }
+audit = { shell = "bandit -q -c pyproject.toml -r src && pip-audit --strict" }
+evals = "python -m tests.evals.run_evals"

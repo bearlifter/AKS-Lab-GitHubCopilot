@@ -48,3 +48,14 @@ async def test_supplier_agent_refuses_shipping_goal(monkeypatch: pytest.MonkeyPa
     assert "refuse" in response.output_text
     assert "shipment" in SYSTEM_PROMPT
     assert "Never invent" in SYSTEM_PROMPT
+
+
+@pytest.mark.asyncio
+async def test_supplier_agent_propagates_tool_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    MockChatClient.reset(errors=[RuntimeError("supplier MCP unavailable")])
+    monkeypatch.setattr("src.agents.supplier.agent.GitHubCopilotAgent", MockChatClient)
+
+    agent = await build_agent(Settings())
+
+    with pytest.raises(RuntimeError, match="supplier MCP unavailable"):
+        await agent.run("Draft a purchase order for SKU ZS-1042 at store-101.")
